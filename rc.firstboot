@@ -1,0 +1,173 @@
+logger -t "rc.firstboot" "Generating SSH host keys"
+
+if [ -d "/etc/ssh/" ] ; then
+  # Remove ssh host keys
+  rm -f /etc/ssh/ssh_host_*
+  systemctl stop sshd
+
+  # Regenerate ssh host keys
+  ssh-keygen -q -t rsa -N "" -f /etc/ssh/ssh_host_rsa_key
+  ssh-keygen -q -t dsa -N "" -f /etc/ssh/ssh_host_dsa_key
+  ssh-keygen -q -t ecdsa -N "" -f /etc/ssh/ssh_host_ecdsa_key
+  ssh-keygen -q -t ed25519 -N "" -f /etc/ssh/ssh_host_ed25519_key
+  systemctl start sshd
+fi
+
+if [ -d "/etc/dropbear/" ] ; then
+  # Remove ssh host keys
+  rm -f /etc/dropbear/dropbear_*
+  systemctl stop dropbear
+
+  # Regenerate ssh host keys
+  dropbearkey -t rsa -f /etc/dropbear/dropbear_rsa_host_key
+  dropbearkey -t dss -f /etc/dropbear/dropbear_dss_host_key
+  dropbearkey -t ecdsa -f /etc/dropbear/dropbear_ecdsa_host_key
+  systemctl start dropbear
+fi
+
+logger -t "rc.firstboot" "Expanding root partition"
+
+# Detect root partition device
+ROOT_PART=$(mount | sed -n 's|^/dev/\(.*\) on / .*|\1|p')
+if [ -z "$ROOT_PART" ] ; then
+  log_warning_msg "unable to detect root partition device"
+  return 1
+fi
+
+# Extract root device name
+case "${ROOT_PART}" in
+  mmcblk0*) ROOT_DEV=mmcblk0 ;;
+  sda*)     ROOT_DEV=sda ;;
+esac
+
+# Check detected root partition name
+PART_NUM=$(echo ${ROOT_PART} | grep -o '[1-9][0-9]*$')
+if [ "$PART_NUM" = "$ROOT_PART" ] ; then
+  logger -t "rc.firstboot" "$ROOT_PART is not an SD card. Don't know how to expand"
+  return 0
+fi
+
+# NOTE: the NOOBS partition layout confuses parted. For now, let's only
+# agree to work with a sufficiently simple partition layout
+if [ "$PART_NUM" -gt 2 ] ; then
+  logger -t "rc.firstboot" "Your partition layout is not currently supported by this tool."
+  return 0
+fi
+
+# Check if last partition number
+LAST_PART_NUM=$(parted /dev/${ROOT_DEV} -ms unit s p | tail -n 1 | cut -f 1 -d:)
+if [ $LAST_PART_NUM -ne $PART_NUM ]; then
+  logger -t "rc.firstboot" "$ROOT_PART is not the last partition. Don't know how to expand"
+  return 0
+fi
+
+# Get the starting offset of the root partition
+PART_START=$(parted /dev/${ROOT_DEV} -ms unit s p | grep "^${PART_NUM}" | cut -f 2 -d: | sed 's/[^0-9]//g')
+if [ -z "$PART_START" ] ; then
+  logger -t "rc.firstboot" "${ROOT_DEV} unable to get starting sector of the partition"
+  return 1
+fi
+
+# Get the possible last sector for the root partition
+PART_LAST=$(fdisk -l /dev/${ROOT_DEV} | grep '^Disk.*sectors' | awk '{ print $7 - 1 }')
+if [ -z "$PART_LAST" ] ; then
+  logger -t "rc.firstboot" "${ROOT_DEV} unable to get last sector of the partition"
+  return 1
+fi
+
+### Since rc.local is run with "sh -e", let's add "|| true" to prevent premature exit
+fdisk /dev/${ROOT_DEV} <<EOF2 || true
+p
+d
+$PART_NUM
+n
+p
+$PART_NUM
+$PART_START
+$PART_LAST
+p
+w
+EOF2
+
+# Reload the partition table, resize root filesystem then remove resizing code from this file
+partprobe &&
+  resize2fs /dev/${ROOT_PART} &&
+  logger -t "rc.firstboot" "Root partition successfully resized."
+
+
+logger -t "rc.firstboot" "Regenerating initramfs to remove encrypted root partition auto-expand"
+
+KERNEL_VERSION=$(uname -r)
+KERNEL_ARCH=$(uname -m)
+INITRAMFS="/boot/firmware/initramfs-${KERNEL_VERSION}"
+INITRAMFS_UBOOT="${INITRAMFS}.uboot"
+
+# Extract kernel arch
+case "${KERNEL_ARCH}" in
+  arm*) KERNEL_ARCH=arm ;;
+esac
+
+# Regenerate initramfs
+if [ -r "${INITRAMFS}" ] ; then
+  rm -f /etc/initramfs-tools/scripts/init-premount/expand_encrypted_rootfs
+  rm -f /etc/initramfs-tools/scripts/local-premount/expand-premount
+  rm -f /etc/initramfs-tools/hooks/expand-tools
+  rm -f "${INITRAMFS}"
+  mkinitramfs -o "${INITRAMFS}" "${KERNEL_VERSION}"
+fi
+
+# Convert generated initramfs for U-Boot using mkimage
+if [ -r "${INITRAMFS_UBOOT}" ] ; then
+  rm -f /etc/initramfs-tools/scripts/init-premount/expand_encrypted_rootfs
+  rm -f /etc/initramfs-tools/scripts/local-premount/expand-premount
+  rm -f /etc/initramfs-tools/hooks/expand-tools
+  rm -f "${INITRAMFS_UBOOT}"
+  mkinitramfs -o "${INITRAMFS}" "${KERNEL_VERSION}"
+  mkimage -A "${KERNEL_ARCH}" -T ramdisk -C none -n "initramfs-${KERNEL_VERSION}" -d "${INITRAMFS}" "${INITRAMFS_UBOOT}"
+  rm -f "${INITRAMFS}"
+fi
+
+
+logger -t "rc.firstboot" "Generating D-Bus machine-id"
+rm -f /var/lib/dbus/machine-id 
+dbus-uuidgen --ensure
+
+logger -t "rc.firstboot" "Creating /etc/resolv.conf symlink"
+
+# Check if systemd resolve directory exists
+if [ ! -d "/run/systemd/resolve" -a ! -e "/etc/resolv.conf" ] ; then
+  systemctl enable systemd-resolved.service
+  systemctl restart systemd-resolved.service
+fi
+
+# Create resolv.conf file if it does not exists
+if [ ! -f "/run/systemd/resolve/resolv.conf" ] ; then
+  touch /run/systemd/resolve/resolv.conf
+fi
+
+# Create symlink to /etc/reolv.conf if not exists yet
+if [ ! -e "/etc/resolv.conf" ] ; then
+  ln -s /run/systemd/resolve/resolv.conf /etc/resolv.conf
+fi
+
+logger -t "rc.firstboot" "Configuring network interface name"
+
+INTERFACE_NAME=$(dmesg | grep "renamed from eth0" | awk -F ":| " '{ print $9 }')
+
+if [ ! -z INTERFACE_NAME ] ; then
+  if [ -r "/etc/systemd/network/eth.network" ] ; then
+    sed -i "s/eth0/${INTERFACE_NAME}/" /etc/systemd/network/eth.network
+  fi
+
+  if [ -r "/lib/systemd/network/10-eth.network" ] ; then
+    sed -i "s/eth0/${INTERFACE_NAME}/" /lib/systemd/network/10-eth.network
+  fi
+fi
+
+logger -t "rc.firstboot" "Reload systemd manager configuration"
+systemctl daemon-reload
+systemctl restart networking.service
+systemctl restart systemd-networkd.service
+logger -t "rc.firstboot" "First boot actions finished"
+rm -f /etc/rc.firstboot
+sed -i '/.*rc.firstboot/d' /etc/rc.local
